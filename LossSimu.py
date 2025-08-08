@@ -1,77 +1,135 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation, PillowWriter
 
 # --- 定数設定 ---
-dt = 0.0666           # 1フレームあたりの時間[s]
-v = 20.2              # 常速[m/s]
-lane_width = 11.25    # レーン幅[m]
-skip = 5              # フレーム間引き
+dt = 0.0666
+v_base = 20.2
+v_target = 22.0
+a = 0.3
+accel_duration = 10.0
+lane_width = 11.25
+skip = 5          # 大幅間引き
+speed_factor = 4  # 再生4倍速
 
 # --- キーフレーム読み込み ---
-df = pd.read_csv('コース対座標 のコピー - シート6.csv', header=None, encoding='utf-8')
+csv_path = 'コース対座標.csv'
+df = pd.read_csv(csv_path, header=None)
 distances = df.iloc[:, 0].values
 xs = df.iloc[:, 1].values
 zs = df.iloc[:, 2].values
 
-# --- シミュレーション関数 ---
-def simulate(lane):
-    d = distances[0]
-    prev_r = None
-    d_prev = None
-    positions = []
-    r0 = np.array([xs[0], zs[0]])
-    r1 = np.array([xs[1], zs[1]])
-    rho0 = np.linalg.norm(r1 - r0) / (distances[1] - distances[0])
-    while d < distances[-1]:
-        idx = np.searchsorted(distances, d) - 1
-        idx = max(0, min(idx, len(distances)-2))
-        d_i, x_i, z_i = distances[idx], xs[idx], zs[idx]
-        d_ip1, x_ip1, z_ip1 = distances[idx+1], xs[idx+1], zs[idx+1]
-        t = (d - d_i) / (d_ip1 - d_i)
-        base = np.array([x_i, z_i]) * (1 - t) + np.array([x_ip1, z_ip1]) * t
-        seg = np.array([x_ip1 - x_i, z_ip1 - z_i])
-        seg_unit = seg / np.linalg.norm(seg)
-        normal = np.array([ seg_unit[1], -seg_unit[0]])
-        r = base + normal * (lane * lane_width)
-        if prev_r is not None:
-            delta_r = np.linalg.norm(r - prev_r)
-            rho = delta_r / (d - d_prev)
-        else:
-            rho = rho0
-        positions.append(r)
-        d_prev = d
-        prev_r = r
-        d += (v * dt) / max(1.0, rho / rho0)
-    return np.array(positions)
+# --- 基準距離比 ---
+rho0 = np.linalg.norm([xs[1]-xs[0], zs[1]-zs[0]]) / (distances[1] - distances[0])
 
-# 両者シミュレーション
-pos1 = simulate(1.0)[::skip]
-pos05 = simulate(0.5)[::skip]
-dt_ss = dt * skip
-n_frames = min(len(pos1), len(pos05))
+# --- シミュレーション ---
+def simulate(lanes):
+    n = len(lanes)
+    d = np.full(n, distances[0], dtype=float)
+    v_curr = np.full(n, v_base, dtype=float)
+    prev_r = [None] * n
+    d_prev = np.zeros(n, dtype=float)
 
-# --- リアルタイム同期アニメーション ---
-plt.ion()
-fig, ax = plt.subplots(figsize=(6,6))
+    pos_list = [[] for _ in lanes]
+    speed_list = [[] for _ in lanes]
+    rho_list_all = [[] for _ in lanes]
+    t = 0.0
+    times = []
+
+    while np.all(d < distances[-1]):
+        # 各レーンの位置計算
+        r_list = []
+        for i, lane in enumerate(lanes):
+            idx = np.clip(np.searchsorted(distances, d[i]) - 1, 0, len(distances) - 2)
+            di, dip1 = distances[idx], distances[idx+1]
+            xi, xip1 = xs[idx], xs[idx+1]
+            zi, zip1 = zs[idx], zs[idx+1]
+            alpha = (d[i] - di) / (dip1 - di)
+            base = np.array([xi, zi]) * (1 - alpha) + np.array([xip1, zip1]) * alpha
+            seg = np.array([xip1 - xi, zip1 - zi])
+            u = seg / np.linalg.norm(seg)
+            normal = np.array([u[1], -u[0]])
+            r = base + normal * (lane * lane_width)
+            r_list.append(r)
+
+        # 走行距離比（ρ）の計算
+        rho_vals = []
+        for i in range(n):
+            if prev_r[i] is not None:
+                rho_vals.append(
+                    np.linalg.norm(r_list[i] - prev_r[i]) / (d[i] - d_prev[i])
+                )
+            else:
+                rho_vals.append(rho0)
+
+        
+
+        # データ記録
+        times.append(t)
+        for i in range(n):
+            pos_list[i].append(r_list[i])
+            speed_list[i].append(v_curr[i])
+            rho_list_all[i].append(rho_vals[i])
+
+        # 次ステップへ
+        for i in range(n):
+            d_prev[i], prev_r[i] = d[i], r_list[i]
+            d[i] += (v_curr[i] * dt) / max(1.0, rho_vals[i] / rho0)
+        t += dt
+
+    # 配列に変換して返す
+    times = np.array(times)
+    pos_arr = [np.array(p) for p in pos_list]
+    speed_arr = [np.array(s) for s in speed_list]
+    rho_arr = [np.array(r) for r in rho_list_all]
+    return times, pos_arr, speed_arr, rho_arr
+
+# --- シミュレーション実行 & GIF作成 ---
+times, pos_list, speed_list, rho_list_all = simulate([1.0, 0.5])
+pos1, pos05 = pos_list
+speed1, speed05 = speed_list
+rho1, rho05 = rho_list_all
+
+# 間引き
+times_s = times[::skip]
+p1 = pos1[::skip]
+p2 = pos05[::skip]
+s1 = speed1[::skip]
+s2 = speed05[::skip]
+r1 = rho1[::skip]
+r2 = rho05[::skip]
+
+fig, ax = plt.subplots(figsize=(4, 4))
 ax.plot(xs, zs, color='gray', linewidth=1)
-horse1, = ax.plot([], [], 'ro', label='Lane 1')
-horse2, = ax.plot([], [], 'bo', label='Lane 0.5')
-ax.set_xlabel('x [m]')
-ax.set_ylabel('z [m]')
+h1, = ax.plot([], [], 'ro', label='Lane1')
+h2, = ax.plot([], [], 'bo', label='Lane0.5')
+text = ax.text(0.02, 0.98, '', transform=ax.transAxes,
+               va='top', ha='left', fontsize=8,
+               bbox=dict(facecolor='white', alpha=0.7))
 ax.set_aspect('equal')
-ax.legend()
-fig.show()
+ax.axis('off')
 
-# --- アニメーションループ ---
-for i in range(n_frames):
-    # ← ここを修正 ↓
-    horse1.set_data([pos1[i,0]],   [pos1[i,1]])
-    horse2.set_data([pos05[i,0]],  [pos05[i,1]])
-    fig.canvas.draw()
-    plt.pause(dt_ss)
+def init():
+    h1.set_data([], [])
+    h2.set_data([], [])
+    text.set_text('')
+    return h1, h2, text
 
-plt.ioff()
-plt.show()
+def update(frame):
+    x1, z1 = p1[frame]
+    x2, z2 = p2[frame]
+    h1.set_data([x1], [z1])
+    h2.set_data([x2], [z2])
+    txt = (f'Lane1: v={s1[frame]:.1f}m/s, ρ={r1[frame]:.3f}\n'
+           f'Lane0.5: v={s2[frame]:.1f}m/s, ρ={r2[frame]:.3f}')
+    text.set_text(txt)
+    return h1, h2, text
 
-plt.ioff()
+ani = FuncAnimation(fig, update, frames=len(times_s),
+                    init_func=init, blit=True)
+fps = speed_factor / (dt * skip)
+gif_path = 'race2_no_accel.gif'
+ani.save(gif_path, writer=PillowWriter(fps=fps))
+
+print(f"生成したGIFファイル: {gif_path}")
